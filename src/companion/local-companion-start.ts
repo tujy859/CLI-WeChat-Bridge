@@ -125,7 +125,7 @@ export function formatRestartUnhealthyMessage(cwd: string): string {
 export function defaultSessionStartMode(
   adapter: LocalCompanionLaunchAdapter,
 ): BridgeSessionStartMode {
-  return adapter === "claude" || adapter === "opencode" ? "new" : "restore";
+  return adapter === "codex" ? "restore" : "new";
 }
 
 export function decideLaunchAction(
@@ -154,7 +154,9 @@ export function decideLaunchAction(
 
   if (
     input.sessionStartMode === "new" &&
-    (input.requestedAdapter === "claude" || input.requestedAdapter === "opencode")
+    (input.requestedAdapter === "claude" ||
+      input.requestedAdapter === "opencode" ||
+      input.requestedAdapter === "pi")
   ) {
     return {
       kind: "start_bridge",
@@ -198,6 +200,7 @@ export function parseCliArgs(argv: string[]): LocalCompanionStartCliOptions {
   let cwd = process.cwd();
   let profile: string | undefined;
   let timeoutMs = DEFAULT_WAIT_TIMEOUT_MS;
+  let sessionStartMode: BridgeSessionStartMode | undefined;
   const cliArgs: string[] = [];
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -213,10 +216,12 @@ export function parseCliArgs(argv: string[]): LocalCompanionStartCliOptions {
           "Usage: wechat-codex-start [--cwd <path>] [--profile <name-or-path>] [--timeout-ms <ms>] [...codex args]",
           "       wechat-claude-start [--cwd <path>] [--profile <name-or-path>] [--timeout-ms <ms>] [...claude args]",
           "       wechat-opencode-start [--cwd <path>] [--profile <name-or-path>] [--timeout-ms <ms>] [...opencode args]",
-          "       local-companion-start [--adapter <codex|claude|opencode>] [--cwd <path>] [--profile <name-or-path>] [--timeout-ms <ms>] [...cli args]",
+          "       wechat-pi-start [--cwd <path>] [--profile <name-or-path>] [--timeout-ms <ms>] [...pi args]",
+          "       local-companion-start [--adapter <codex|claude|opencode|pi>] [--cwd <path>] [--profile <name-or-path>] [--timeout-ms <ms>] [...cli args]",
           "",
           "Starts a bridge for the current directory, waits for the local endpoint, then opens the visible companion or panel.",
-          "Claude and OpenCode launchers start a fresh CLI session by default.",
+          "Claude, OpenCode, and Pi launchers start a fresh CLI session by default.",
+          "Use --session-start-mode restore to explicitly restore the previous session.",
           "All adapters are companion-bound: closing the companion/panel also stops the bridge.",
           "Unknown arguments are forwarded to the visible CLI client.",
           "",
@@ -226,7 +231,7 @@ export function parseCliArgs(argv: string[]): LocalCompanionStartCliOptions {
     }
 
     if (arg === "--adapter") {
-      if (!next || !["codex", "claude", "opencode"].includes(next)) {
+      if (!next || !["codex", "claude", "opencode", "pi"].includes(next)) {
         throw new Error(`Invalid adapter: ${next ?? "(missing)"}`);
       }
       adapter = next as LocalCompanionLaunchAdapter;
@@ -265,6 +270,15 @@ export function parseCliArgs(argv: string[]): LocalCompanionStartCliOptions {
       continue;
     }
 
+    if (arg === "--session-start-mode") {
+      if (!next || !["restore", "new"].includes(next)) {
+        throw new Error(`Invalid session start mode: ${next ?? "(missing)"}`);
+      }
+      sessionStartMode = next as BridgeSessionStartMode;
+      i += 1;
+      continue;
+    }
+
     cliArgs.push(arg);
   }
 
@@ -273,7 +287,7 @@ export function parseCliArgs(argv: string[]): LocalCompanionStartCliOptions {
     cwd,
     profile,
     timeoutMs,
-    sessionStartMode: defaultSessionStartMode(adapter),
+    sessionStartMode: sessionStartMode ?? defaultSessionStartMode(adapter),
     cliArgs,
   };
 }
@@ -324,7 +338,12 @@ async function stopExistingBridge(
     throw new Error(`Timed out waiting for existing bridge pid=${pid} to exit.`);
   }
 
-  if (lock.adapter === "codex" || lock.adapter === "claude" || lock.adapter === "opencode") {
+  if (
+    lock.adapter === "codex" ||
+    lock.adapter === "claude" ||
+    lock.adapter === "opencode" ||
+    lock.adapter === "pi"
+  ) {
     clearLocalCompanionEndpoint(cwd, undefined, { adapter: lock.adapter });
   } else {
     clearLocalCompanionEndpoint(cwd);
@@ -574,7 +593,8 @@ export async function tryDelegateToDaemon(
     cliArgs: options.cliArgs,
     openVisible: true,
     sessionStartMode: options.sessionStartMode,
-    reuseExistingVisible: true,
+    reuseExistingVisible:
+      options.adapter !== "pi" || options.sessionStartMode !== "new",
   });
   if (!response.ok) {
     throw new Error(response.error);

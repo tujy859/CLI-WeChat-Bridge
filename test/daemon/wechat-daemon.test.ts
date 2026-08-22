@@ -13,7 +13,10 @@ import {
   formatDaemonStatus,
   parseDaemonCliArgs,
   parseDaemonSwitchCommand,
+  parseDaemonSwitchDirective,
   resolveDaemonSessionStartMode,
+  shouldRestartDeadCodexVisibleRuntime,
+  waitForCodexVisibleThread,
   waitForVisibleClientConnection,
 } from "../../src/daemon/wechat-daemon.ts";
 import type { BridgeLockPayload } from "../../src/bridge/bridge-state.ts";
@@ -57,7 +60,31 @@ describe("wechat-daemon helpers", () => {
     expect(parseDaemonSwitchCommand("/codex")).toBe("codex");
     expect(parseDaemonSwitchCommand("/claude")).toBe("claude");
     expect(parseDaemonSwitchCommand("/opencode")).toBe("opencode");
+    expect(parseDaemonSwitchCommand("/pi")).toBe("pi");
     expect(parseDaemonSwitchCommand("/status")).toBeNull();
+  });
+
+  test("parseDaemonSwitchDirective intercepts and separates prompts for every adapter", () => {
+    for (const adapter of ["claude", "codex", "pi", "opencode"] as const) {
+      expect(parseDaemonSwitchDirective(`/${adapter} hi`)).toEqual({
+        adapter,
+        remainder: "hi",
+      });
+      expect(parseDaemonSwitchDirective(`  /${adapter.toUpperCase()}   inspect the project  `)).toEqual({
+        adapter,
+        remainder: "inspect the project",
+      });
+      expect(parseDaemonSwitchDirective(`/${adapter}`)).toEqual({
+        adapter,
+        remainder: "",
+      });
+    }
+  });
+
+  test("parseDaemonSwitchDirective does not intercept similar prompt text", () => {
+    expect(parseDaemonSwitchDirective("/claudex hi")).toBeNull();
+    expect(parseDaemonSwitchDirective("please use /claude hi")).toBeNull();
+    expect(parseDaemonSwitchDirective("/status hi")).toBeNull();
   });
 
   test("parseDaemonCliArgs binds daemon to cwd and optional initial adapter", () => {
@@ -93,19 +120,21 @@ describe("wechat-daemon helpers", () => {
     expect(args).not.toContain("--adapter");
   });
 
-  test("buildVisibleClientLaunchArgs routes Claude and OpenCode through local companion", () => {
-    const args = buildVisibleClientLaunchArgs({
-      adapter: "opencode",
-      cwd: path.resolve("./tmp/project"),
-    });
+  test("buildVisibleClientLaunchArgs routes Claude, OpenCode, and Pi through local companion", () => {
+    for (const adapter of ["claude", "opencode", "pi"] as const) {
+      const args = buildVisibleClientLaunchArgs({
+        adapter,
+        cwd: path.resolve("./tmp/project"),
+      });
 
-    expect(args.some((arg) => arg.endsWith("local-companion.ts"))).toBe(true);
-    expect(args).toContain("--adapter");
-    expect(args).toContain("opencode");
+      expect(args.some((arg) => arg.endsWith("local-companion.ts"))).toBe(true);
+      expect(args).toContain("--adapter");
+      expect(args).toContain(adapter);
+    }
   });
 
   test("buildVisibleClientLaunchArgs can request a fresh local companion session", () => {
-    for (const adapter of ["claude", "opencode"] as const) {
+    for (const adapter of ["claude", "opencode", "pi"] as const) {
       const args = buildVisibleClientLaunchArgs({
         adapter,
         cwd: path.resolve("./tmp/project"),
@@ -117,10 +146,11 @@ describe("wechat-daemon helpers", () => {
     }
   });
 
-  test("defaultDaemonSessionStartMode starts Claude and OpenCode fresh", () => {
+  test("defaultDaemonSessionStartMode restores Codex while starting other adapters fresh", () => {
     expect(defaultDaemonSessionStartMode("codex")).toBe("restore");
     expect(defaultDaemonSessionStartMode("claude")).toBe("new");
     expect(defaultDaemonSessionStartMode("opencode")).toBe("new");
+    expect(defaultDaemonSessionStartMode("pi")).toBe("new");
   });
 
   test("resolveDaemonSessionStartMode avoids restoring stale OpenCode sessions", () => {
@@ -188,6 +218,43 @@ describe("wechat-daemon helpers", () => {
     ).toBe("restore");
   });
 
+  test("resolveDaemonSessionStartMode starts Pi fresh when opening its first visible companion", () => {
+    expect(
+      resolveDaemonSessionStartMode({
+        adapter: "pi",
+        slotCreated: true,
+        visibleConnected: false,
+      }),
+    ).toBe("new");
+  });
+
+  test("restarts an existing Codex runtime after its visible client exits", () => {
+    expect(
+      shouldRestartDeadCodexVisibleRuntime({
+        adapter: "codex",
+        slotCreated: false,
+        hadVisibleClient: true,
+        visibleConnected: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRestartDeadCodexVisibleRuntime({
+        adapter: "codex",
+        slotCreated: false,
+        hadVisibleClient: true,
+        visibleConnected: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldRestartDeadCodexVisibleRuntime({
+        adapter: "claude",
+        slotCreated: false,
+        hadVisibleClient: true,
+        visibleConnected: false,
+      }),
+    ).toBe(false);
+  });
+
   test("buildWindowsVisibleClientLaunchCommand opens a titled console window", () => {
     const command = buildWindowsVisibleClientLaunchCommand({
       adapter: "claude",
@@ -226,6 +293,14 @@ describe("wechat-daemon helpers", () => {
         ],
       }),
     ).toContain("active: codex");
+    expect(
+      formatDaemonStatus({
+        cwd: "D:/work/project",
+        activeAdapter: "pi",
+        startedAt: "2026-05-22T00:00:00.000Z",
+        slots: [],
+      }),
+    ).toContain("pi: not started");
   });
 
   test("formatDaemonSwitchResultDetail reports automatic visible CLI outcomes", () => {
@@ -254,6 +329,16 @@ describe("wechat-daemon helpers", () => {
         previousActiveAdapter: "claude",
       }),
     ).toContain("Active terminal remains claude");
+
+    expect(
+      formatDaemonSwitchResultDetail({
+        created: true,
+        openedVisible: true,
+        visibleConnected: true,
+        visibleReady: false,
+        activated: false,
+      }),
+    ).toContain("active thread is not ready yet");
   });
 
   test("waitForVisibleClientConnection resolves when the visible companion appears", async () => {
@@ -304,6 +389,50 @@ describe("wechat-daemon helpers", () => {
 
     expect(connected).toBe(false);
     expect(now).toBe(500);
+  });
+
+  test("waitForCodexVisibleThread waits for the local visible thread", async () => {
+    let now = 0;
+    let threadId: string | undefined;
+
+    const result = await waitForCodexVisibleThread(
+      {
+        getThreadId: () => threadId,
+        timeoutMs: 500,
+        pollMs: 50,
+      },
+      {
+        now: () => now,
+        sleep: async (ms) => {
+          now += ms;
+          if (now >= 150) {
+            threadId = "thread_visible";
+          }
+        },
+      },
+    );
+
+    expect(result).toBe("thread_visible");
+  });
+
+  test("waitForCodexVisibleThread returns null when no thread becomes ready", async () => {
+    let now = 0;
+
+    const result = await waitForCodexVisibleThread(
+      {
+        getThreadId: () => undefined,
+        timeoutMs: 100,
+        pollMs: 25,
+      },
+      {
+        now: () => now,
+        sleep: async (ms) => {
+          now += ms;
+        },
+      },
+    );
+
+    expect(result).toBeNull();
   });
 
   test("cleanupDaemonBeforeStart returns none when no daemon endpoint exists", async () => {
